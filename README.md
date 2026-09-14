@@ -8,7 +8,7 @@
 
 ```bash
 cd ~/Desktop/uni/3sem
-git clone <url> reportgen
+git clone https://origin.cursor.com/why-not-dev/reportgen.git reportgen
 python3 -m pip install -r reportgen/requirements.txt
 ```
 
