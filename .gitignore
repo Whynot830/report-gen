@@ -7,3 +7,10 @@ venv/
 *.egg-info/
 dist/
 build/
+
+# Пейлоады и ассеты конкретных практических работ — только локально
+payloads/*
+!payloads/__init__.py
+!payloads/example.py
+assets/*
+!assets/gost_styles.docx

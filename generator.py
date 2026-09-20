@@ -2,26 +2,32 @@
 
 from __future__ import annotations
 
+import re
+from copy import deepcopy
 from pathlib import Path
 
 from docx import Document
 from docx.enum.style import WD_STYLE_TYPE
 from docx.enum.table import WD_TABLE_ALIGNMENT
 from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.text.paragraph import Paragraph
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Cm, Pt
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_BASE = ROOT.parent
+BUILTIN_STYLES = ROOT / "assets" / "gost_styles.docx"
 
-HEADING_NUM_ABSTRACT = 90
-HEADING_NUM_ID = 90
-REF_ABSTRACT = 80
-REF_NUM_ID = 80
+# Свободные id: в gost_styles.docx заняты num 1–94 и abstract 0–79.
+HEADING_NUM_ABSTRACT = 200
+HEADING_NUM_ID = 200
+REF_ABSTRACT = 201
+REF_NUM_ID = 201
 REF_STYLE_NAME = "References List"
 REF_STYLE_ID = "ReferencesList"
 UNORDERED_STYLE = "Unordered List Paragraph"
+FIGURE_NUM_RE = re.compile(r"^Рисунок\s+\d+(?:\.\d+)?\s*[–-]\s*")
 
 
 def h1(text: str) -> dict:
@@ -45,7 +51,8 @@ def ul(*items: str) -> dict:
 
 
 def table(caption: str, headers: list, rows: list, continue_caption: str | None = None) -> dict:
-    block = {"t": "table", "caption": caption, "headers": headers, "rows": rows}
+    block = {"t": "table", "caption": caption,
+             "headers": headers, "rows": rows}
     if continue_caption:
         block["continue_caption"] = continue_caption
     return block
@@ -53,6 +60,10 @@ def table(caption: str, headers: list, rows: list, continue_caption: str | None 
 
 def fig(path: str | Path, caption: str, width_cm: float = 16.5) -> dict:
     return {"t": "figure", "path": str(path), "caption": caption, "width_cm": width_cm}
+
+
+def listing(caption: str, code: str) -> dict:
+    return {"t": "listing", "caption": caption, "code": code}
 
 
 def refs(*items: str) -> dict:
@@ -74,6 +85,14 @@ def _clear_first_line_override_needed(p):
         ind = OxmlElement("w:ind")
         pPr.append(ind)
     ind.set(qn("w:firstLine"), "0")
+    if qn("w:firstLineChars") in ind.attrib:
+        del ind.attrib[qn("w:firstLineChars")]
+
+
+def _clear_title_first_line(doc: Document) -> None:
+    """На титуле нет красной строки: first line 0 у всех абзацев, включая таблицы."""
+    for p_el in doc.element.body.iter(qn("w:p")):
+        _clear_first_line_override_needed(Paragraph(p_el, doc))
 
 
 def _set_paragraph_text(para, text: str) -> None:
@@ -84,6 +103,81 @@ def _set_paragraph_text(para, text: str) -> None:
     else:
         run = para.add_run(text)
         _set_run_font(run, size=14)
+
+
+def _student_group(student_label: str, fallback: str = "") -> str:
+    marker = "группы "
+    if marker in student_label:
+        return student_label.split(marker, 1)[1].strip()
+    return fallback
+
+
+def _fill_title_student(doc: Document, student_label: str, student_name: str) -> None:
+    group = _student_group(student_label)
+    for table in doc.tables:
+        for row in table.rows:
+            if len(row.cells) < 2:
+                continue
+            left = row.cells[0]
+            right = row.cells[1]
+            for para in left.paragraphs:
+                if "Выполнил студент группы" in para.text:
+                    _set_paragraph_text(
+                        para, f"Выполнил студент группы {group}")
+                    name_para = next((p for p in reversed(
+                        right.paragraphs) if p.text.strip()), None)
+                    if name_para is not None:
+                        _set_paragraph_text(name_para, student_name)
+                    return
+                if "Студент" in para.text and para.runs:
+                    para.runs[0].text = student_label
+                    for run in para.runs[1:]:
+                        run.text = ""
+                    for rpara in right.paragraphs:
+                        if rpara.text.strip() and rpara.runs:
+                            rpara.runs[0].text = student_name
+                            for run in rpara.runs[1:]:
+                                run.text = ""
+                            break
+                    return
+
+
+def _part_by_rel_suffix(document: Document, suffix: str):
+    for rel in document.part.rels.values():
+        if rel.reltype.endswith(suffix):
+            return rel.target_part
+    return None
+
+
+def _apply_builtin_styles(doc: Document) -> None:
+    """Подставить styles.xml и numbering.xml из вшитого ГОСТ-шаблона."""
+    donor = Document(str(BUILTIN_STYLES))
+    src_styles = _part_by_rel_suffix(donor, "/styles")
+    dst_styles = _part_by_rel_suffix(doc, "/styles")
+    if src_styles is None or dst_styles is None:
+        raise RuntimeError("Не найден styles.xml у шаблона или у вшитых стилей")
+    dst_styles._element = deepcopy(src_styles.element)
+    doc.styles._element = dst_styles._element
+
+    src_num = _part_by_rel_suffix(donor, "/numbering")
+    dst_num = _part_by_rel_suffix(doc, "/numbering")
+    if src_num is None:
+        raise RuntimeError("Во вшитых стилях нет numbering.xml")
+    if dst_num is None:
+        raise RuntimeError("В титульном шаблоне нет numbering.xml")
+    dst_num._element = deepcopy(src_num.element)
+
+
+def _apply_page_setup(doc: Document) -> None:
+    """Поля страницы по ГОСТ: левое 3 см, правое 1,5 см, верх/низ 2 см."""
+    for section in doc.sections:
+        section.top_margin = Cm(2)
+        section.bottom_margin = Cm(2)
+        section.left_margin = Cm(3)
+        section.right_margin = Cm(1.5)
+        section.gutter = Cm(0)
+        section.header_distance = Cm(1)
+        section.footer_distance = Cm(1)
 
 
 def _clone_title(
@@ -111,18 +205,7 @@ def _clone_title(
         elif discipline and "по дисциплине" in para.text:
             _set_paragraph_text(para, f"по дисциплине «{discipline}»")
 
-    if len(doc.tables) >= 2:
-        t = doc.tables[1]
-        for para in t.rows[0].cells[0].paragraphs:
-            if "Студент" in para.text and para.runs:
-                para.runs[0].text = student_label
-                for run in para.runs[1:]:
-                    run.text = ""
-        for para in t.rows[0].cells[1].paragraphs:
-            if para.text.strip() and para.runs:
-                para.runs[0].text = student_name
-                for run in para.runs[1:]:
-                    run.text = ""
+    _fill_title_student(doc, student_label, student_name)
     return doc
 
 
@@ -201,64 +284,27 @@ def _add_heading_numbering(doc: Document) -> None:
 
 
 def _apply_heading_base_styles(doc: Document) -> None:
-    """H2/H3: first line 1.25 cm, single, after 8 pt. H1: центр и page break before."""
-    for name, outline, numbered_ilvl in (
-        ("Heading 1", "0", None),
-        ("Heading 2", "1", "0"),
-        ("Heading 3", "2", "1"),
-    ):
+    """К стилям H2/H3 из ГОСТ-шаблона добавить только автонумерацию 1 / 1.1."""
+    for name, numbered_ilvl in (("Heading 2", "0"), ("Heading 3", "1")):
         style = doc.styles[name]
         pPr = style.element.find(qn("w:pPr"))
         if pPr is None:
             pPr = OxmlElement("w:pPr")
             style.element.append(pPr)
-        for tag in ("w:pageBreakBefore", "w:spacing", "w:ind", "w:jc", "w:numPr"):
-            el = pPr.find(qn(tag))
-            if el is not None:
-                pPr.remove(el)
-
-        if name == "Heading 1":
-            pPr.append(OxmlElement("w:pageBreakBefore"))
-
-        spacing = OxmlElement("w:spacing")
-        spacing.set(qn("w:after"), "160")
-        spacing.set(qn("w:line"), "240")
-        spacing.set(qn("w:lineRule"), "auto")
-        pPr.append(spacing)
-
-        ind = OxmlElement("w:ind")
-        ind.set(qn("w:left"), "0")
-        ind.set(qn("w:right"), "0")
-        ind.set(qn("w:firstLine"), "0" if name == "Heading 1" else "709")
-        pPr.append(ind)
-
-        if name == "Heading 1":
-            jc = OxmlElement("w:jc")
-            jc.set(qn("w:val"), "center")
-            pPr.append(jc)
-
-        if numbered_ilvl is not None:
-            numPr = OxmlElement("w:numPr")
-            ilvl = OxmlElement("w:ilvl")
-            ilvl.set(qn("w:val"), numbered_ilvl)
-            num_id = OxmlElement("w:numId")
-            num_id.set(qn("w:val"), str(HEADING_NUM_ID))
-            numPr.append(ilvl)
-            numPr.append(num_id)
-            pPr.append(numPr)
-
-        outline_el = pPr.find(qn("w:outlineLvl"))
-        if outline_el is None:
-            outline_el = OxmlElement("w:outlineLvl")
-            pPr.append(outline_el)
-        outline_el.set(qn("w:val"), outline)
+        old = pPr.find(qn("w:numPr"))
+        if old is not None:
+            pPr.remove(old)
+        numPr = OxmlElement("w:numPr")
+        ilvl = OxmlElement("w:ilvl")
+        ilvl.set(qn("w:val"), numbered_ilvl)
+        num_id = OxmlElement("w:numId")
+        num_id.set(qn("w:val"), str(HEADING_NUM_ID))
+        numPr.append(ilvl)
+        numPr.append(num_id)
+        pPr.append(numPr)
 
 
-def _apply_table_name_style(doc: Document) -> None:
-    try:
-        style = doc.styles["Table Name"]
-    except KeyError:
-        return
+def _set_style_font_size(style, half_points: str = "28") -> None:
     rPr = style.element.find(qn("w:rPr"))
     if rPr is None:
         rPr = OxmlElement("w:rPr")
@@ -268,11 +314,25 @@ def _apply_table_name_style(doc: Document) -> None:
         if el is not None:
             rPr.remove(el)
     sz = OxmlElement("w:sz")
-    sz.set(qn("w:val"), "28")
+    sz.set(qn("w:val"), half_points)
     sz_cs = OxmlElement("w:szCs")
-    sz_cs.set(qn("w:val"), "28")
+    sz_cs.set(qn("w:val"), half_points)
     rPr.append(sz)
     rPr.append(sz_cs)
+
+
+def _apply_table_name_style(doc: Document) -> None:
+    try:
+        _set_style_font_size(doc.styles["Table Name"], "28")
+    except KeyError:
+        return
+
+
+def _apply_img_caption_style(doc: Document) -> None:
+    try:
+        _set_style_font_size(doc.styles["IMG Caption"], "28")
+    except KeyError:
+        return
 
 
 def _add_references_style(doc: Document) -> None:
@@ -421,17 +481,29 @@ def _add_blank(doc: Document) -> None:
     _clear_first_line_override_needed(p)
 
 
-def _add_caption(doc: Document, text: str, *, figure: bool = False) -> None:
+def _style_names(doc: Document) -> set[str]:
+    return {s.name for s in doc.styles}
+
+
+def _add_caption(doc: Document, text: str, *, figure: bool = False, listing: bool = False) -> None:
+    names = _style_names(doc)
+    if figure:
+        text = FIGURE_NUM_RE.sub("", text)
+        style_name = "IMG Caption" if "IMG Caption" in names else "Table Name"
+    elif listing:
+        style_name = "Listing Name" if "Listing Name" in names else "Table Name"
+    else:
+        style_name = "Table Name"
     p = doc.add_paragraph()
-    style_name = "IMG Caption" if figure and "IMG Caption" in [s.name for s in doc.styles] else "Table Name"
     try:
         p.style = doc.styles[style_name]
     except KeyError:
         p.style = doc.styles["Normal"]
-    p.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.CENTER if figure else WD_ALIGN_PARAGRAPH.LEFT
+    if figure:
+        p.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.CENTER
     _clear_first_line_override_needed(p)
     run = p.add_run(text)
-    _set_run_font(run, size=12 if figure else 14)
+    _set_run_font(run, size=14)
 
 
 def _set_cell_border(cell) -> None:
@@ -527,6 +599,28 @@ def _add_refs(doc: Document, items: list[str]) -> None:
         _set_run_font(run, size=14)
 
 
+def _add_listing(doc: Document, code: str) -> None:
+    lines = code.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    if lines and lines[-1] == "":
+        lines = lines[:-1]
+    para = doc.add_paragraph()
+    names = _style_names(doc)
+    if "Code" in names:
+        para.style = doc.styles["Code"]
+    else:
+        para.style = doc.styles["Normal"]
+    _clear_first_line_override_needed(para)
+    para.paragraph_format.space_before = Pt(0)
+    para.paragraph_format.space_after = Pt(8)
+    para.paragraph_format.line_spacing = 1.0
+    for i, line in enumerate(lines or [""]):
+        run = para.add_run(line if line else " ")
+        if "Code" not in names:
+            _set_run_font(run, size=10, name="Courier New")
+        if i < len(lines) - 1:
+            run.add_break()
+
+
 def _render_blocks(doc: Document, blocks: list[dict], base: Path) -> None:
     for block in blocks:
         kind = block["t"]
@@ -553,6 +647,10 @@ def _render_blocks(doc: Document, blocks: list[dict], base: Path) -> None:
             _add_figure(doc, path, block.get("width_cm", 16.5))
             _add_caption(doc, block["caption"], figure=True)
             _add_blank(doc)
+        elif kind == "listing":
+            _add_caption(doc, block["caption"], listing=True)
+            _add_listing(doc, block["code"])
+            _add_blank(doc)
         elif kind == "refs":
             _add_refs(doc, block["items"])
         else:
@@ -573,14 +671,18 @@ def build_report(payload: dict, *, base: Path | None = None) -> Path:
     doc = _clone_title(
         template,
         work_no=meta["work_no"],
-        student_label=meta.get("student_label", "Студент группы ИКМО-06-25"),
-        student_name=meta.get("student_name", "Нурулла А."),
+        student_label=meta.get("student_label", ""),
+        student_name=meta.get("student_name", ""),
         discipline=meta.get("discipline"),
     )
+    _apply_builtin_styles(doc)
+    _clear_title_first_line(doc)
+    _apply_page_setup(doc)
     _set_update_fields(doc)
     _add_heading_numbering(doc)
     _apply_heading_base_styles(doc)
     _apply_table_name_style(doc)
+    _apply_img_caption_style(doc)
     _add_references_style(doc)
     _add_toc(doc)
     _render_blocks(doc, payload["blocks"], base)
