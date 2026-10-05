@@ -42,8 +42,11 @@ def h3(text: str) -> dict:
     return {"t": "h3", "text": text}
 
 
-def p(text: str) -> dict:
-    return {"t": "p", "text": text}
+def p(text: str, *, bold: bool = False) -> dict:
+    block = {"t": "p", "text": text}
+    if bold:
+        block["bold"] = True
+    return block
 
 
 def ul(*items: str) -> dict:
@@ -209,15 +212,6 @@ def _clone_title(
     return doc
 
 
-def _set_update_fields(doc: Document) -> None:
-    settings = doc.settings.element
-    existing = settings.find(qn("w:updateFields"))
-    if existing is None:
-        el = OxmlElement("w:updateFields")
-        el.set(qn("w:val"), "true")
-        settings.append(el)
-
-
 def _ensure_num(numbering, num_id: int, abstract_id: int) -> None:
     for num in numbering.findall(qn("w:num")):
         if num.get(qn("w:numId")) == str(num_id):
@@ -321,11 +315,37 @@ def _set_style_font_size(style, half_points: str = "28") -> None:
     rPr.append(sz_cs)
 
 
+def _force_single_zero_spacing(style) -> None:
+    """Одинарный интервал, 0 пт до и после абзаца."""
+    pPr = style.element.find(qn("w:pPr"))
+    if pPr is None:
+        pPr = OxmlElement("w:pPr")
+        style.element.append(pPr)
+    old = pPr.find(qn("w:spacing"))
+    if old is not None:
+        pPr.remove(old)
+    spacing = OxmlElement("w:spacing")
+    spacing.set(qn("w:before"), "0")
+    spacing.set(qn("w:after"), "0")
+    spacing.set(qn("w:line"), "240")
+    spacing.set(qn("w:lineRule"), "auto")
+    pPr.append(spacing)
+
+
 def _apply_table_name_style(doc: Document) -> None:
+    """Table Name и Listing Name — один и тот же абзацный стиль подписи."""
     try:
-        _set_style_font_size(doc.styles["Table Name"], "28")
+        table_style = doc.styles["Table Name"]
     except KeyError:
         return
+    _set_style_font_size(table_style, "28")
+    _force_single_zero_spacing(table_style)
+    try:
+        listing_style = doc.styles["Listing Name"]
+    except KeyError:
+        return
+    _set_style_font_size(listing_style, "28")
+    _force_single_zero_spacing(listing_style)
 
 
 def _apply_img_caption_style(doc: Document) -> None:
@@ -418,53 +438,48 @@ def _add_references_style(doc: Document) -> None:
     pPr.append(jc)
 
 
+def _highlight_yellow(run) -> None:
+    rPr = run._element.get_or_add_rPr()
+    old = rPr.find(qn("w:highlight"))
+    if old is not None:
+        rPr.remove(old)
+    highlight = OxmlElement("w:highlight")
+    highlight.set(qn("w:val"), "yellow")
+    rPr.append(highlight)
+
+
 def _add_toc(doc: Document) -> None:
     title = doc.add_paragraph()
-    title.style = doc.styles["Centered"]
+    title.style = doc.styles["Normal"]
+    _clear_first_line_override_needed(title)
+    title.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.CENTER
     run = title.add_run("СОДЕРЖАНИЕ")
     _set_run_font(run, size=14, bold=True)
 
     p = doc.add_paragraph()
     _clear_first_line_override_needed(p)
     p.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.LEFT
-
-    run_begin = p.add_run()
-    fld_begin = OxmlElement("w:fldChar")
-    fld_begin.set(qn("w:fldCharType"), "begin")
-    run_begin._r.append(fld_begin)
-
-    run_instr = p.add_run()
-    instr = OxmlElement("w:instrText")
-    instr.set(qn("xml:space"), "preserve")
-    instr.text = ' TOC \\o "1-2" \\h \\z \\u '
-    run_instr._r.append(instr)
-
-    run_sep = p.add_run()
-    fld_sep = OxmlElement("w:fldChar")
-    fld_sep.set(qn("w:fldCharType"), "separate")
-    run_sep._r.append(fld_sep)
-
-    hint = p.add_run("Правый щелчок по содержанию → Обновить поле")
-    _set_run_font(hint, size=12)
-
-    run_end = p.add_run()
-    fld_end = OxmlElement("w:fldChar")
-    fld_end.set(qn("w:fldCharType"), "end")
-    run_end._r.append(fld_end)
+    p.paragraph_format.space_before = Pt(0)
+    p.paragraph_format.space_after = Pt(0)
+    hint = p.add_run("Сгенерировать содержание")
+    _set_run_font(hint, size=14, bold=True)
+    _highlight_yellow(hint)
 
 
 def _add_heading(doc: Document, text: str, level: int) -> None:
+    if level == 1:
+        text = text.upper()
     p = doc.add_paragraph()
     p.style = doc.styles[f"Heading {level}"]
     run = p.add_run(text)
     _set_run_font(run, size=14, bold=True)
 
 
-def _add_body(doc: Document, text: str) -> None:
+def _add_body(doc: Document, text: str, *, bold: bool = False) -> None:
     p = doc.add_paragraph()
     p.style = doc.styles["Normal"]
     run = p.add_run(text)
-    _set_run_font(run, size=14)
+    _set_run_font(run, size=14, bold=True if bold else None)
 
 
 def _add_ul(doc: Document, items: list[str]) -> None:
@@ -476,9 +491,15 @@ def _add_ul(doc: Document, items: list[str]) -> None:
 
 
 def _add_blank(doc: Document) -> None:
+    """Видимая пустая строка. Пустой абзац без текста Word схлопывает."""
     p = doc.add_paragraph()
     p.style = doc.styles["Normal"]
     _clear_first_line_override_needed(p)
+    p.paragraph_format.space_before = Pt(0)
+    p.paragraph_format.space_after = Pt(0)
+    p.paragraph_format.line_spacing = 1.0
+    run = p.add_run(" ")
+    _set_run_font(run, size=14)
 
 
 def _style_names(doc: Document) -> set[str]:
@@ -491,7 +512,7 @@ def _add_caption(doc: Document, text: str, *, figure: bool = False, listing: boo
         text = FIGURE_NUM_RE.sub("", text)
         style_name = "IMG Caption" if "IMG Caption" in names else "Table Name"
     elif listing:
-        style_name = "Listing Name" if "Listing Name" in names else "Table Name"
+        style_name = "Table Name" if "Table Name" in names else "Listing Name"
     else:
         style_name = "Table Name"
     p = doc.add_paragraph()
@@ -537,15 +558,42 @@ def _set_cell_margins(cell, cm: float = 0.15) -> None:
     tcPr.append(tcMar)
 
 
+def _clear_cell_shading(cell) -> None:
+    tcPr = cell._tc.get_or_add_tcPr()
+    old = tcPr.find(qn("w:shd"))
+    if old is not None:
+        tcPr.remove(old)
+
+
+def _plain_table_look(table) -> None:
+    """Table Grid без условного оформления: первая строка не заливается."""
+    tblPr = table._tbl.tblPr
+    old = tblPr.find(qn("w:tblLook"))
+    if old is not None:
+        tblPr.remove(old)
+    look = OxmlElement("w:tblLook")
+    look.set(qn("w:val"), "0600")
+    look.set(qn("w:firstRow"), "0")
+    look.set(qn("w:lastRow"), "0")
+    look.set(qn("w:firstColumn"), "0")
+    look.set(qn("w:lastColumn"), "0")
+    look.set(qn("w:noHBand"), "1")
+    look.set(qn("w:noVBand"), "1")
+    tblPr.append(look)
+
+
 def _set_cell_text(cell, text: str, *, bold: bool = False) -> None:
     cell.text = ""
     p = cell.paragraphs[0]
+    p.style = "Normal"
     p.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.LEFT
     _clear_first_line_override_needed(p)
+    p.paragraph_format.line_spacing = 1.25
     run = p.add_run(str(text))
     _set_run_font(run, size=12, bold=bold)
     _set_cell_border(cell)
     _set_cell_margins(cell, 0.15)
+    _clear_cell_shading(cell)
 
 
 def _set_table_cell_margins(table, cm: float = 0.15) -> None:
@@ -575,6 +623,7 @@ def _add_table(doc: Document, headers: list, rows: list) -> None:
         table.style = "Table Grid"
     except KeyError:
         pass
+    _plain_table_look(table)
     _set_table_cell_margins(table, 0.15)
     for i, header in enumerate(headers):
         _set_cell_text(table.rows[0].cells[i], header, bold=True)
@@ -611,7 +660,7 @@ def _add_listing(doc: Document, code: str) -> None:
         para.style = doc.styles["Normal"]
     _clear_first_line_override_needed(para)
     para.paragraph_format.space_before = Pt(0)
-    para.paragraph_format.space_after = Pt(8)
+    para.paragraph_format.space_after = Pt(0)
     para.paragraph_format.line_spacing = 1.0
     for i, line in enumerate(lines or [""]):
         run = para.add_run(line if line else " ")
@@ -631,7 +680,7 @@ def _render_blocks(doc: Document, blocks: list[dict], base: Path) -> None:
         elif kind == "h3":
             _add_heading(doc, block["text"], 3)
         elif kind == "p":
-            _add_body(doc, block["text"])
+            _add_body(doc, block["text"], bold=bool(block.get("bold")))
         elif kind == "ul":
             _add_ul(doc, block["items"])
         elif kind == "table":
@@ -678,7 +727,6 @@ def build_report(payload: dict, *, base: Path | None = None) -> Path:
     _apply_builtin_styles(doc)
     _clear_title_first_line(doc)
     _apply_page_setup(doc)
-    _set_update_fields(doc)
     _add_heading_numbering(doc)
     _apply_heading_base_styles(doc)
     _apply_table_name_style(doc)
